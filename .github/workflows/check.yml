@@ -1,0 +1,87 @@
+# Build the SCO sysroot with clang-retro's clang and run the examples in
+# scorun (32-bit x86 UnixWare and OpenServer programs on Linux), for every
+# pull request and push.
+#
+# clang comes from clang-retro/llvm's llvm-prebuilt release, which holds the
+# LLVM tools built from recent commits of its main branch; the newest Linux
+# one is used, with compiler-rt from the same commit and picolibc from
+# clang-retro/picolibc's main branch.
+name: Check
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'LICENSE*']
+  pull_request:
+    paths-ignore: ['**/*.md', 'LICENSE*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sco:
+    name: UnixWare and OpenServer (32-bit x86)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ninja-build cmake meson
+      - name: Get clang
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset=$(gh api repos/clang-retro/llvm/releases/tags/llvm-prebuilt --jq \
+            '[.assets[] | select(.name | startswith("llvm-linux-"))] | sort_by(.created_at) | last | .name')
+          echo "Using $asset"
+          gh release download llvm-prebuilt -R clang-retro/llvm -p "$asset" -O llvm.tar.zst
+          mkdir -p "$RUNNER_TEMP/llvm"
+          tar --zstd -xf llvm.tar.zst -C "$RUNNER_TEMP/llvm"
+          rm llvm.tar.zst
+          echo "BIN=$RUNNER_TEMP/llvm/bin" >> "$GITHUB_ENV"
+          sha=${asset#llvm-linux-}
+          echo "LLVM_SHA=${sha%%-*}" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/llvm/bin/clang" --version
+          "$RUNNER_TEMP/llvm/bin/clang" --target=i386-pc-sco -dM -E -x c /dev/null | grep -q __SCO__ ||
+            { echo "::error::$asset has no i386-pc-sco target yet"; exit 1; }
+      - name: Get compiler-rt's builtins
+        uses: actions/checkout@v4
+        with:
+          repository: clang-retro/llvm
+          ref: ${{ env.LLVM_SHA }}
+          path: llvm
+          sparse-checkout: |
+            compiler-rt/lib/builtins
+            compiler-rt/cmake
+            compiler-rt/include
+            cmake
+            llvm/cmake
+          persist-credentials: false
+      - name: Get picolibc
+        uses: actions/checkout@v4
+        with:
+          repository: clang-retro/picolibc
+          path: picolibc
+          persist-credentials: false
+      - name: Build the sysroot
+        run: |
+          LLVM_SRC=$PWD/llvm PICOLIBC_SRC=$PWD/picolibc WORK=$RUNNER_TEMP/build-sco \
+            ./build-sysroot.sh sysroot/i386-pc-sco
+      - name: Tests
+        run: |
+          CC=$BIN/clang SYSROOT=$PWD/sysroot/i386-pc-sco tests/run-tests.sh tests-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: i386-pc-sco-sysroot
+          path: sysroot/
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: sco-tests-out
+          path: tests-out/
+          retention-days: 7
